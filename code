@@ -1,1 +1,161 @@
+!pip install torch torchvision
+!pip install datasets
+!pip install transformers
+!pip install scikit-learn
+!pip install matplotlib
+
+# Deep Embedded Clustering (DEC) for AG News Dataset with Comments
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.datasets import fetch_20newsgroups
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+from transformers import BertTokenizer, BertModel
+from datasets import load_dataset
+
+
+# ================= Step 1: Load and Embed AG News using BERT =================
+print("Loading AG News dataset...")
+ag_news = load_dataset("ag_news", split='train[:1000]')  # Subset for faster prototyping
+
+print("Loading BERT tokenizer and model...")
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+bert = BertModel.from_pretrained('bert-base-uncased')
+bert.eval()
+
+
+def get_bert_embeddings(texts):
+    inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="pt", max_length=128)
+    with torch.no_grad():
+        outputs = bert(**inputs)
+    return outputs.last_hidden_state[:, 0, :]  # Use CLS token embedding
+
+
+print("Embedding articles with BERT...")
+texts = [x['text'] for x in ag_news]
+labels = [x['label'] for x in ag_news]  # Ground truth (not used for training)
+
+embeddings = []
+for i in range(0, len(texts), 32):  # Batch in chunks
+    batch_texts = texts[i:i + 32]
+    batch_embeds = get_bert_embeddings(batch_texts)
+    embeddings.append(batch_embeds)
+
+embeddings = torch.cat(embeddings, dim=0)
+
+
+# ================= Step 2: Autoencoder Definition =================
+class Autoencoder(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=256, latent_dim=64):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim)
+        )
+
+    def forward(self, x):
+        z = self.encoder(x)
+        x_recon = self.decoder(z)
+        return x_recon, z
+
+
+# ================= Step 3: Train Autoencoder =================
+autoencoder = Autoencoder()
+optimizer = optim.Adam(autoencoder.parameters(), lr=1e-3)
+criterion = nn.MSELoss()
+
+print("Training Autoencoder...")
+dataloader = DataLoader(TensorDataset(embeddings), batch_size=64, shuffle=True)
+for epoch in range(10):
+    total_loss = 0
+    for batch in dataloader:
+        x = batch[0]
+        x_recon, _ = autoencoder(x)
+        loss = criterion(x_recon, x)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    print(f"Epoch {epoch + 1}, Loss: {total_loss:.4f}")
+
+
+# ================= Step 4: KMeans Initialization =================
+print("Getting latent features and initializing KMeans...")
+with torch.no_grad():
+    z = autoencoder.encoder(embeddings).numpy()
+
+kmeans = KMeans(n_clusters=4, n_init=20)
+y_pred_init = kmeans.fit_predict(z)
+cluster_centers = torch.tensor(kmeans.cluster_centers_, dtype=torch.float)
+
+
+# ================= Step 5: Deep Embedded Clustering =================
+class DEC(nn.Module):
+    def __init__(self, autoencoder, cluster_centers):
+        super().__init__()
+        self.encoder = autoencoder.encoder
+        self.cluster_centers = nn.Parameter(cluster_centers)
+
+    def forward(self, x):
+        z = self.encoder(x)
+        q = 1.0 / (1.0 + torch.sum((z.unsqueeze(1) - self.cluster_centers) ** 2, dim=2))
+        q = q / torch.sum(q, dim=1, keepdim=True)  # Soft assignment
+        return q, z
+
+
+def target_distribution(q):
+    weight = q ** 2 / q.sum(0)
+    return (weight.t() / weight.sum(1)).t()
+
+
+dec = DEC(autoencoder, cluster_centers)
+optimizer = optim.Adam(dec.parameters(), lr=1e-3)
+
+print("Training DEC...")
+dataloader = DataLoader(TensorDataset(embeddings), batch_size=64, shuffle=True)
+
+for epoch in range(10):
+    total_loss = 0
+    for batch in dataloader:
+        x = batch[0]
+        q, z = dec(x)
+        p = target_distribution(q).detach()
+        loss = torch.nn.functional.kl_div(q.log(), p, reduction='batchmean')
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    print(f"Epoch {epoch + 1}, KL Loss: {total_loss:.4f}")
+
+
+# ================= Step 6: Evaluate & Visualize =================
+print("Evaluating clustering...")
+with torch.no_grad():
+    _, z = dec(embeddings)
+    z_np = z.numpy()
+    y_pred = torch.argmax(_, dim=1).numpy()
+
+sil_score = silhouette_score(z_np, y_pred)
+print(f"Silhouette Score: {sil_score:.4f}")
+
+print("Visualizing clusters with t-SNE...")
+tsne = TSNE(n_components=2, perplexity=30, n_iter=300)
+z_2d = tsne.fit_transform(z_np)
+
+plt.figure(figsize=(8, 6))
+plt.scatter(z_2d[:, 0], z_2d[:, 1], c=y_pred, cmap='tab10')
+plt.title("DEC Clusters Visualized with t-SNE")
+plt.show()
 
